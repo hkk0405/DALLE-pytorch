@@ -19,7 +19,8 @@ from torchvision.utils import make_grid, save_image
 # dalle classes and utils
 
 from dalle_pytorch import distributed_utils
-from dalle_pytorch import DiscreteVAE
+from dalle_pytorch import OpenAIDVAE
+
 
 # argument parsing
 
@@ -134,24 +135,21 @@ else:
 dl = DataLoader(ds, BATCH_SIZE, shuffle = not data_sampler, sampler=data_sampler)
 
 vae_params = dict(
+    model_path = MODEL_PATH,
     image_size = IMAGE_SIZE,
-    num_layers = NUM_LAYERS,
     num_tokens = NUM_TOKENS,
-    channels = CHANNELS,
     codebook_dim = EMB_DIM,
     hidden_dim   = HIDDEN_DIM,
-    num_resnet_blocks = NUM_RESNET_BLOCKS
-)
-
-vae = DiscreteVAE(
-    **vae_params,
     smooth_l1_loss = SMOOTH_L1_LOSS,
-    kl_div_loss_weight = KL_LOSS_WEIGHT
+    kl_div_loss_weight = KL_LOSS_WEIGHT,
+    # num_layers = NUM_LAYERS,
+    # channels = CHANNELS,
+    # num_resnet_blocks = NUM_RESNET_BLOCKS
 )
 
-if MODEL_PATH:
-    w = torch.load(MODEL_PATH, map_location='cpu')['module']
-    vae.load_state_dict(w)
+vae = OpenAIDVAE(
+    **vae_params
+)
 
 if not using_deepspeed:
     vae = vae.cuda()
@@ -189,7 +187,10 @@ if distr_backend.is_root_worker():
 # distribute
 
 distr_backend.check_batch_size(BATCH_SIZE)
-deepspeed_config = {'train_batch_size': BATCH_SIZE}
+deepspeed_config = {
+    'train_batch_size': BATCH_SIZE, 
+    # 'bf16': {'enable': True}
+    }
 
 (distr_vae, distr_opt, distr_dl, distr_sched) = distr_backend.distribute(
     args=args,
@@ -247,7 +248,7 @@ for epoch in range(EPOCHS):
             return_recons = True,
             temp = temp
         )
-
+        # print(loss.dtype, recons.dtype)
         if using_deepspeed:
             # Gradients are automatically zeroed after the step
             distr_vae.backward(loss)
@@ -256,9 +257,8 @@ for epoch in range(EPOCHS):
             distr_opt.zero_grad()
             loss.backward()
             distr_opt.step()
-
+        
         logs = {}
-
         if i % 100 == 0:
             if distr_backend.is_root_worker():
                 k = NUM_IMAGES_SAVE
@@ -280,7 +280,7 @@ for epoch in range(EPOCHS):
                     'temperature':          temp
                 }
 
-                wandb.save('./vae.pt')
+                # wandb.save('./vae.pt')
 
             # lr decay
 
@@ -288,8 +288,8 @@ for epoch in range(EPOCHS):
             if not using_deepspeed_sched:
                 distr_sched.step()
         
-        if i % 1000 == 0:
-            save_model(f'./vae.pt')
+            if i % 1000 == 0:
+                save_model(f'./vae.pt')
         
         # temperature anneal
         temp = max(temp * math.exp(-ANNEAL_RATE * global_step), TEMP_MIN)
@@ -313,21 +313,22 @@ for epoch in range(EPOCHS):
             wandb.log(logs)
         global_step += 1
 
-    if distr_backend.is_root_worker():
+    # if distr_backend.is_root_worker():
         # save trained model to wandb as an artifact every epoch's end
 
-        model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
-        model_artifact.add_file('vae.pt')
-        run.log_artifact(model_artifact)
-
+        # model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
+        # model_artifact.add_file('vae.pt')
+        # run.log_artifact(model_artifact)
+    
+    if epoch == EPOCHS-1:
+        # save final vae and cleanup
+        save_model('./vae-final.pt')
+    
 if distr_backend.is_root_worker():
-    # save final vae and cleanup
+    # wandb.save('./vae-final.pt')
 
-    save_model('./vae-final.pt')
-    wandb.save('./vae-final.pt')
-
-    model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
-    model_artifact.add_file('vae-final.pt')
-    run.log_artifact(model_artifact)
+    # model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
+    # model_artifact.add_file('vae-final.pt')
+    # run.log_artifact(model_artifact)
 
     wandb.finish()

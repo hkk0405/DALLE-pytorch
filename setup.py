@@ -26,15 +26,14 @@ setup(
     'packaging',
     'pillow',
     'regex',
-    'rotary-embedding-torch',
+    'rotary-embedding-torch==0.3.6',
+    'pytorch-lightning==1.9.0',
     'taming-transformers-rom1504',
     'tokenizers',
-    'torch>=1.6',
-    'torchvision',
-    'transformers',
     'tqdm',
     'youtokentome',
-    'WebDataset'
+    'WebDataset',
+    'pdf2image'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

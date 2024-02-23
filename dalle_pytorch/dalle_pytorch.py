@@ -8,7 +8,7 @@ from axial_positional_embedding import AxialPositionalEmbedding
 from einops import rearrange
 
 from dalle_pytorch import distributed_utils
-from dalle_pytorch.vae import OpenAIDiscreteVAE, VQGanVAE
+from dalle_pytorch.vae import OpenAIDiscreteVAE, VQGanVAE, map_pixels, unmap_pixels
 from dalle_pytorch.transformer import Transformer, DivideMax
 
 # helpers
@@ -116,7 +116,7 @@ class DiscreteVAE(nn.Module):
         normalization = ((*((0.5,) * 3), 0), (*((0.5,) * 3), 1))
     ):
         super().__init__()
-        assert log2(image_size).is_integer(), 'image size must be a power of 2'
+        # assert log2(image_size).is_integer(), 'image size must be a power of 2'
         assert num_layers >= 1, 'number of layers must be greater than or equal to 1'
         has_resblocks = num_resnet_blocks > 0
 
@@ -266,6 +266,158 @@ class DiscreteVAE(nn.Module):
             return loss
 
         return loss, out
+
+
+class OpenAIDVAE(nn.Module):
+    def __init__(
+        self,
+        model_path = None,
+        image_size = 256,
+        num_tokens = 8192,
+        codebook_dim = 128,
+        # num_layers = 3,
+        # num_resnet_blocks = 0,
+        hidden_dim = 256,
+        channels = 3,
+        smooth_l1_loss = False,
+        temperature = 0.9,
+        straight_through = False,
+        reinmax = False,
+        kl_div_loss_weight = 0.,
+        # normalization = ((*((0.5,) * 3), 0), (*((0.5,) * 3), 1)),
+        use_mixed_precision = False
+    ):
+        super().__init__()
+        # assert log2(image_size).is_integer(), 'image size must be a power of 2'
+        # assert num_layers >= 1, 'number of layers must be greater than or equal to 1'
+        # has_resblocks = num_resnet_blocks > 0
+
+        self.channels = channels
+        self.image_size = image_size
+        self.num_tokens = num_tokens
+        # self.num_layers = num_layers
+        self.temperature = temperature
+        self.straight_through = straight_through
+        self.reinmax = reinmax
+        
+        model_params = dict(
+            vocab_size=num_tokens, 
+            n_init=codebook_dim, 
+            n_hid=hidden_dim
+            )
+            
+        if model_path.endswith('.pt'):
+            self.vae = OpenAIDiscreteVAE(**model_params, use_mixed_precision=use_mixed_precision)
+            self.vae.load_state_dict(torch.load(model_path, map_location='cpu')['module'])
+        else:
+            self.vae = OpenAIDiscreteVAE(**model_params, model_path=model_path, use_mixed_precision=use_mixed_precision)
+        
+        self.loss_fn = F.smooth_l1_loss if smooth_l1_loss else F.mse_loss
+        # self.ppl_loss_fn = F.cross_entropy
+        self.kl_div_loss_weight = kl_div_loss_weight
+
+        # take care of normalization within class
+        # self.normalization = tuple(map(lambda t: t[:channels], normalization))
+
+        self._register_external_parameters()
+
+    def _register_external_parameters(self):
+        """Register external parameters for DeepSpeed partitioning."""
+        if (
+                not distributed_utils.is_distributed
+                or not distributed_utils.using_backend(
+                    distributed_utils.DeepSpeedBackend)
+        ):
+            return
+
+        deepspeed = distributed_utils.backend.backend_module
+        # deepspeed.zero.register_external_parameter(self, self.vae.state_dict())
+
+    def norm(self, images):
+        if not exists(self.normalization):
+            return images
+
+        means, stds = map(lambda t: torch.as_tensor(t).to(images), self.normalization)
+        means, stds = map(lambda t: rearrange(t, 'c -> () c () ()'), (means, stds))
+        images = images.clone()
+        images.sub_(means).div_(stds)
+        return images
+
+    @torch.no_grad()
+    @eval_decorator
+    def get_codebook_indices(self, images):
+        return self.vae.get_codebook_indices(images)
+
+    def decode(self, img_seq):
+        images = self.vae.decode(img_seq)
+        return images
+
+    def forward(
+        self,
+        img,
+        return_loss = False,
+        return_recons = False,
+        return_logits = False,
+        temp = None
+    ):
+        device, num_tokens, image_size, kl_div_loss_weight = img.device, self.num_tokens, self.image_size, self.kl_div_loss_weight
+        assert img.shape[-1] == image_size and img.shape[-2] == image_size, f'input must have the correct image size {image_size}'
+
+        img = map_pixels(img)
+        # img = self.norm(img)
+        
+        logits = self.vae.enc(img)
+        
+        if return_logits:
+            return logits # return logits for getting hard image indices for DALL-E training
+
+        temp = default(temp, self.temperature)
+
+        one_hot = F.gumbel_softmax(logits, tau = temp, dim = 1, hard = self.straight_through)
+        
+        if self.straight_through and self.reinmax:
+            # use reinmax for better second-order accuracy - https://arxiv.org/abs/2304.08612
+            # algorithm 2
+            one_hot = one_hot.detach()
+            π0 = logits.softmax(dim = 1)
+            π1 = (one_hot + (logits / temp).softmax(dim = 1)) / 2
+            π1 = ((log(π1) - logits).detach() + logits).softmax(dim = 1)
+            π2 = 2 * π1 - 0.5 * π0
+            one_hot = π2 - π2.detach() + one_hot
+        
+        sampled = self.vae.dec.blocks.input(one_hot)
+        out = self.vae.dec.blocks.group_1(sampled)
+        out = self.vae.dec.blocks.group_2(out)
+        out = self.vae.dec.blocks.group_3(out)
+        out = self.vae.dec.blocks.group_4(out)
+        out = self.vae.dec.blocks.output(out)
+        
+        if out.dtype != torch.float32:
+            out = out.float()
+        # out = unmap_pixels(torch.sigmoid(out[:, :3]))
+        out = unmap_pixels(out[:, :3])
+        # out = out[:, :3]
+
+        if not return_loss:
+            return out
+
+        # reconstruction loss
+        recon_loss = self.loss_fn(img, out)
+        
+        # ppl loss
+
+        # kl divergence
+        logits = rearrange(logits, 'b n h w -> b (h w) n')
+        log_qy = F.log_softmax(logits, dim = -1)
+        log_uniform = torch.log(torch.tensor([1. / num_tokens], device = device))
+        kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target = True)
+        loss = recon_loss + (kl_div * kl_div_loss_weight)
+
+        if not return_recons:
+            return loss
+
+        return loss, out
+
 
 # main classes
 

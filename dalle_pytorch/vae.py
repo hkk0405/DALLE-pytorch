@@ -24,6 +24,8 @@ from einops import rearrange
 
 from dalle_pytorch import distributed_utils
 
+from dall_e import Encoder, Decoder
+
 # constants
 
 CACHE_PATH = os.path.expanduser("~/.cache/dalle")
@@ -109,12 +111,18 @@ def get_pkg_version(pkg_name):
 # pretrained Discrete VAE from OpenAI
 
 class OpenAIDiscreteVAE(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size, n_init, n_hid, model_path=None, use_mixed_precision=False):
         super().__init__()
-        assert version.parse(get_pkg_version('torch')) < version.parse('1.11.0'), 'torch version must be <= 1.10 in order to use OpenAI discrete vae'
-
-        self.enc = load_model(download(OPENAI_VAE_ENCODER_PATH))
-        self.dec = load_model(download(OPENAI_VAE_DECODER_PATH))
+        # assert version.parse(get_pkg_version('torch')) < version.parse('1.11.0'), 'torch version must be <= 1.10 in order to use OpenAI discrete vae'
+        self.enc = Encoder(n_hid=n_hid, vocab_size=vocab_size, use_mixed_precision=use_mixed_precision)
+        self.dec = Decoder(n_init=n_init, n_hid=n_hid, vocab_size=vocab_size, use_mixed_precision=use_mixed_precision)
+        if model_path:
+            try:
+                self.enc.load_state_dict(load_model(os.path.join(model_path, 'encoder.pkl')).state_dict())
+                self.dec.load_state_dict(load_model(os.path.join(model_path, 'decoder.pkl')).state_dict())
+            except:
+                self.enc.load_state_dict(load_model(download(OPENAI_VAE_ENCODER_PATH)).state_dict())
+                self.dec.load_state_dict(load_model(download(OPENAI_VAE_DECODER_PATH)).state_dict())
         make_contiguous(self)
 
         self.channels = 3
@@ -136,7 +144,8 @@ class OpenAIDiscreteVAE(nn.Module):
         z = F.one_hot(img_seq, num_classes = self.num_tokens)
         z = rearrange(z, 'b h w c -> b c h w').float()
         x_stats = self.dec(z).float()
-        x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
+        # x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))
+        x_rec = unmap_pixels(x_stats[:, :3])
         return x_rec
 
     def forward(self, img):
